@@ -28,6 +28,32 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
+      - name: Write build summary
+        run: |
+          {
+            echo "## Build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Node | \`$(node --version)\` |"
+            echo "| Commit | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) |"
+            echo ""
+            echo "### Bundle"
+            echo ""
+            echo "| File | Size | Gzip |"
+            echo "|---|---:|---:|"
+            total=0
+            total_gz=0
+            while IFS= read -r f; do
+              size=$(stat -c %s "$f")
+              gz=$(gzip -c "$f" | wc -c)
+              total=$((total + size))
+              total_gz=$((total_gz + gz))
+              echo "| \`${f#dist/}\` | $(numfmt --to=iec --suffix=B "$size") | $(numfmt --to=iec --suffix=B "$gz") |"
+            done < <(find dist -type f | sort)
+            echo "| **Total** | **$(numfmt --to=iec --suffix=B "$total")** | **$(numfmt --to=iec --suffix=B "$total_gz")** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v7
         with:
           name: dist
@@ -52,15 +78,41 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       # Hashed build assets can be cached forever; everything else must revalidate.
+      # Output is also logged to sync.log so the summary can count uploads/deletes.
       - name: Sync hashed assets
         run: |
+          set -o pipefail
           aws s3 sync dist/assets "s3://${{ vars.S3_BUCKET }}/assets" \
             --delete \
-            --cache-control "public, max-age=31536000, immutable"
+            --no-progress \
+            --cache-control "public, max-age=31536000, immutable" | tee -a sync.log
 
       - name: Sync remaining files
         run: |
+          set -o pipefail
           aws s3 sync dist "s3://${{ vars.S3_BUCKET }}" \
             --delete \
+            --no-progress \
             --exclude "assets/*" \
-            --cache-control "no-cache"
+            --cache-control "no-cache" | tee -a sync.log
+
+      - name: Write deploy summary
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          uploaded=$(grep -c '^upload:' sync.log || true)
+          deleted=$(grep -c '^delete:' sync.log || true)
+          {
+            echo "## Deployed :rocket:"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Site | $SITE_URL |"
+            echo "| Bucket | \`$S3_BUCKET\` ($AWS_REGION) |"
+            echo "| Commit | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) |"
+            echo "| Files uploaded | $uploaded |"
+            echo "| Files deleted | $deleted |"
+            echo "| Deployed at | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
+          } >> "$GITHUB_STEP_SUMMARY"
