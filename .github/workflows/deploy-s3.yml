@@ -1,0 +1,79 @@
+name: Deploy to S3
+
+# Reusable workflow: deploys the build artifact to the S3 bucket of the given environment.
+# S3_BUCKET, SITE_URL and AWS_ROLE_ARN are environment variables, so each environment
+# resolves its own values. The caller must grant `id-token: write` for AWS OIDC.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment to deploy to (e.g. staging, production)
+        required: true
+        type: string
+      artifact-name:
+        description: Name of the build artifact to deploy
+        required: false
+        type: string
+        default: dist
+
+permissions:
+  contents: read
+  id-token: write # required for AWS OIDC
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.SITE_URL }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Hashed build assets can be cached forever; everything else must revalidate.
+      # Output is also logged to sync.log so the summary can count uploads/deletes.
+      - name: Sync hashed assets
+        run: |
+          set -o pipefail
+          aws s3 sync dist/assets "s3://${{ vars.S3_BUCKET }}/assets" \
+            --delete \
+            --no-progress \
+            --cache-control "public, max-age=31536000, immutable" | tee -a sync.log
+
+      - name: Sync remaining files
+        run: |
+          set -o pipefail
+          aws s3 sync dist "s3://${{ vars.S3_BUCKET }}" \
+            --delete \
+            --no-progress \
+            --exclude "assets/*" \
+            --cache-control "no-cache" | tee -a sync.log
+
+      - name: Write deploy summary
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SITE_URL: ${{ vars.SITE_URL }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          uploaded=$(grep -c '^upload:' sync.log || true)
+          deleted=$(grep -c '^delete:' sync.log || true)
+          {
+            echo "## Deployed to $DEPLOY_ENV :rocket:"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Site | $SITE_URL |"
+            echo "| Bucket | \`$S3_BUCKET\` ($AWS_REGION) |"
+            echo "| Commit | [\`${GITHUB_SHA::7}\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) |"
+            echo "| Files uploaded | $uploaded |"
+            echo "| Files deleted | $deleted |"
+            echo "| Deployed at | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
+          } >> "$GITHUB_STEP_SUMMARY"
